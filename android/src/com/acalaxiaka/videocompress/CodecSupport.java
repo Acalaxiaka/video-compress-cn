@@ -37,6 +37,11 @@ public final class CodecSupport {
     }
     public static Enc best(String mime) { List<Enc> l = encoders(mime); return l.isEmpty() ? null : l.get(0); }
 
+    public static MediaCodecInfo byName(String name) {
+        for (MediaCodecInfo i : new MediaCodecList(MediaCodecList.REGULAR_CODECS).getCodecInfos()) if (i.getName().equals(name)) return i;
+        throw new IllegalArgumentException(name);
+    }
+
     public static boolean sizeOk(Enc e, int w, int h) {
         try { return e.info.getCapabilitiesForType(e.mime).getVideoCapabilities().isSizeSupported(w, h); }
         catch (Exception ex) { return false; }

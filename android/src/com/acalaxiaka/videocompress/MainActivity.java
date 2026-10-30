@@ -12,7 +12,6 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
-import android.os.PowerManager;
 import android.provider.MediaStore;
 import android.provider.OpenableColumns;
 import android.text.InputType;
@@ -29,26 +28,44 @@ public class MainActivity extends Activity {
     static final int REQ_PICK = 1;
     static final String OUT_DIR = "AngioCompress";
 
-    static final class Job {
-        Uri uri; String name; long size; Transcoder.Probe probe; String error;
-        long outSize; TextView tv; ProgressBar pb; volatile int state; // 0待处理 1进行中 2完成 3跳过 4失败 5取消
-    }
-
-    private final List<Job> jobs = new ArrayList<>();
+    private final java.util.Map<Engine.Job, TextView> tvs = new java.util.HashMap<>();
+    private final java.util.Map<Engine.Job, ProgressBar> pbs = new java.util.HashMap<>();
+    private TextView tvLog;
+    private static final List<Engine.Job> jobs = Engine.jobs;
     private LinearLayout jobList, customPanel;
     private RadioGroup presetGroup;
     private Spinner spCodec, spRes, spAudio;
     private SeekBar sbQuality; private TextView tvQuality, tvSummary;
     private EditText etBitrate;
     private Button btnStart, btnCancel, btnPick, btnClear;
-    private volatile Transcoder current; private volatile boolean stopAll; private Thread worker;
-    private PowerManager.WakeLock wl;
 
     @Override protected void onCreate(Bundle b) {
         super.onCreate(b);
         buildUi();
+        for (Engine.Job j : jobs) addRow(j);
+        Engine.listener = this::render; AppLog.listener = () -> runOnUiThread(this::renderLog);
+        render(); renderLog();
+        if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != android.content.pm.PackageManager.PERMISSION_GRANTED)
+            requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 3);
         handleShare(getIntent());
     }
+
+    @Override protected void onDestroy() { super.onDestroy(); if (Engine.listener != null) Engine.listener = null; AppLog.listener = null; }
+
+    private void render() {
+        for (Engine.Job j : jobs) {
+            TextView tv = tvs.get(j); ProgressBar pb = pbs.get(j); if (tv == null) continue;
+            if (j.state != Engine.WAIT || j.text.isEmpty()) { if (!j.text.isEmpty()) { tv.setText(j.text); tv.setTextColor(j.color); } }
+            pb.setProgress(Math.round(j.progress * 1000));
+        }
+        boolean r = Engine.running;
+        btnStart.setEnabled(!r); btnCancel.setEnabled(r); btnPick.setEnabled(!r); btnClear.setEnabled(!r);
+        if (r) getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON); else getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        updateSummary();
+    }
+
+    private void renderLog() { if (tvLog != null) tvLog.setText(AppLog.tail(logExpanded ? 300 : 25)); }
+    private boolean logExpanded;
 
     @Override protected void onNewIntent(Intent i) { super.onNewIntent(i); handleShare(i); }
 
@@ -137,12 +154,26 @@ public class MainActivity extends Activity {
         btnPick.setOnClickListener(v -> pick());
         btnStart.setOnClickListener(v -> start());
         btnCancel.setOnClickListener(v -> cancel());
-        btnClear.setOnClickListener(v -> { if (worker == null) { jobs.clear(); jobList.removeAllViews(); updateSummary(); } });
+        btnClear.setOnClickListener(v -> { if (!Engine.running) { synchronized (jobs) { jobs.clear(); } tvs.clear(); pbs.clear(); jobList.removeAllViews(); updateSummary(); } });
 
         tvSummary = label("尚未选择视频", 14, true); root.addView(tvSummary);
         jobList = new LinearLayout(this); jobList.setOrientation(LinearLayout.VERTICAL); root.addView(jobList);
 
-        root.addView(label("说明：若预计输出不小于原文件，将自动跳过并提示；压缩后若实际体积反而更大，也不会保存。AVI 等系统不支持的格式会提示错误。处理时请保持本页面在前台。", 12, false));
+        root.addView(label("诊断日志", 16, true));
+        LinearLayout lrow = new LinearLayout(this);
+        Button bCopy = new Button(this); bCopy.setText("复制日志");
+        Button bMore = new Button(this); bMore.setText("展开/收起");
+        lrow.addView(bCopy, new LinearLayout.LayoutParams(0, -2, 1)); lrow.addView(bMore, new LinearLayout.LayoutParams(0, -2, 1));
+        root.addView(lrow);
+        tvLog = new TextView(this); tvLog.setTextSize(11); tvLog.setTypeface(Typeface.MONOSPACE); tvLog.setTextIsSelectable(true);
+        tvLog.setBackgroundColor(0xFF263238); tvLog.setTextColor(0xFFECEFF1); tvLog.setPadding(dp(8), dp(8), dp(8), dp(8));
+        root.addView(tvLog);
+        bCopy.setOnClickListener(v -> {
+            ((android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE)).setPrimaryClip(android.content.ClipData.newPlainText("VideoCompress 日志", AppLog.dump()));
+            toast("日志已复制，可粘贴发送");
+        });
+        bMore.setOnClickListener(v -> { logExpanded = !logExpanded; renderLog(); });
+        root.addView(label("说明：若预计输出不小于原文件，将自动跳过并提示；压缩后若实际体积反而更大，也不会保存。AVI 等系统不支持的格式会提示错误。处理在前台服务中进行，熄屏或切换应用也会继续，通知栏可查看进度和取消。单个 MP4 超过约 3.5 GB 会自动分段保存。", 12, false));
         setContentView(sv);
     }
 
@@ -165,7 +196,7 @@ public class MainActivity extends Activity {
     private void addUris(List<Uri> uris, boolean persist) {
         for (Uri u : uris) {
             if (persist) try { getContentResolver().takePersistableUriPermission(u, Intent.FLAG_GRANT_READ_URI_PERMISSION); } catch (Exception ignored) {}
-            Job j = new Job(); j.uri = u; j.name = "video"; j.size = -1;
+            Engine.Job j = new Engine.Job(); j.uri = u; j.name = "video"; j.size = -1;
             if ("file".equals(u.getScheme())) { File f = new File(u.getPath()); j.name = f.getName(); j.size = f.length(); }
             try (Cursor c = getContentResolver().query(u, null, null, null, null)) {
                 if (c != null && c.moveToFirst()) {
@@ -173,22 +204,26 @@ public class MainActivity extends Activity {
                     if (ni >= 0) j.name = c.getString(ni); if (si >= 0 && !c.isNull(si)) j.size = c.getLong(si);
                 }
             } catch (Exception ignored) {}
-            LinearLayout box = new LinearLayout(this); box.setOrientation(LinearLayout.VERTICAL); box.setPadding(dp(8), dp(8), dp(8), dp(8));
-            box.setBackgroundColor(0xFFFAFAFA);
-            j.tv = new TextView(this); j.tv.setTextSize(13); j.tv.setTextColor(0xFF333333); j.tv.setText(j.name + "\n正在读取信息…");
-            j.pb = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal); j.pb.setMax(1000);
-            box.addView(j.tv); box.addView(j.pb);
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2); lp.topMargin = dp(6);
-            jobList.addView(box, lp);
-            jobs.add(j);
+            synchronized (jobs) { jobs.add(j); } addRow(j);
             new Thread(() -> {
                 try { j.probe = Transcoder.probe(this, j.uri, j.size); }
-                catch (Transcoder.TranscodeException e) { j.error = e.getMessage(); j.state = 4; }
-                catch (Exception e) { j.error = "读取失败：" + e.getMessage(); j.state = 4; }
+                catch (Transcoder.TranscodeException e) { j.error = e.getMessage(); j.state = Engine.FAILED; }
+                catch (Exception e) { j.error = "读取失败：" + e.getMessage(); j.state = Engine.FAILED; }
                 runOnUiThread(this::refreshEstimates);
             }).start();
         }
         updateSummary();
+    }
+
+    private void addRow(Engine.Job j) {
+        LinearLayout box = new LinearLayout(this); box.setOrientation(LinearLayout.VERTICAL); box.setPadding(dp(8), dp(8), dp(8), dp(8));
+        box.setBackgroundColor(0xFFFAFAFA);
+        TextView tv = new TextView(this); tv.setTextSize(13); tv.setTextColor(0xFF333333); tv.setText(j.text.isEmpty() ? j.name + "\n正在读取信息…" : j.text);
+        tv.setTextIsSelectable(true);
+        ProgressBar pb = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal); pb.setMax(1000);
+        box.addView(tv); box.addView(pb);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2); lp.topMargin = dp(6);
+        jobList.addView(box, lp); tvs.put(j, tv); pbs.put(j, pb);
     }
 
     private Transcoder.Settings settings() {
@@ -208,9 +243,10 @@ public class MainActivity extends Activity {
     private void refreshEstimates() {
         if (presetGroup == null) return;
         Transcoder.Settings s = settings();
-        for (Job j : jobs) {
-            if (j.state != 0 && j.state != 4) continue;
-            if (j.state == 4) { j.tv.setText(j.name + "\n❌ " + j.error); j.tv.setTextColor(0xFFC62828); continue; }
+        for (Engine.Job j : jobs) {
+            TextView jtv = tvs.get(j); if (jtv == null) continue;
+            if (j.state != Engine.WAIT && j.state != Engine.FAILED) continue;
+            if (j.state == Engine.FAILED) { if (j.text.isEmpty()) { j.text = j.name + "\n❌ " + j.error; j.color = 0xFFC62828; } jtv.setText(j.text); jtv.setTextColor(j.color); continue; }
             if (j.probe == null) continue;
             Transcoder.Probe p = j.probe;
             String info = String.format(Locale.CHINA, "%s\n%d×%d · %.2f fps · %s · %s · 旋转 %d°", j.name, p.w, p.h, p.fps,
@@ -221,7 +257,7 @@ public class MainActivity extends Activity {
                         BitrateCalc.human(pl.estBytes), pct(pl.estBytes, p.size));
                 if (BitrateCalc.shouldSkip(pl.estBytes, p.size)) info += "\n⚠️ 预计不会变小，将跳过";
             } catch (Exception e) { info += "\n⚠️ " + e.getMessage(); }
-            j.tv.setText(info);
+            jtv.setText(info);
         }
         updateSummary();
     }
@@ -234,85 +270,24 @@ public class MainActivity extends Activity {
 
     private void updateSummary() {
         long in = 0, out = 0; int done = 0;
-        for (Job j : jobs) if (j.state == 2) { done++; in += j.size; out += j.outSize; }
+        for (Engine.Job j : jobs) if (j.state == Engine.DONE) { done++; in += j.size; out += j.outSize; }
         String s = "队列：" + jobs.size() + " 个";
         if (done > 0) s += String.format(Locale.CHINA, "；已完成 %d 个：%s → %s（%s）", done, BitrateCalc.human(in), BitrateCalc.human(out), pct(out, in));
         tvSummary.setText(s);
     }
 
     private void start() {
-        if (worker != null) return;
-        boolean any = false; for (Job j : jobs) if (j.state == 0 && j.probe != null) any = true;
-        if (!any) { toast("请先选择视频"); return; }
-        final Transcoder.Settings s = settings();
-        stopAll = false; btnStart.setEnabled(false); btnCancel.setEnabled(true); btnPick.setEnabled(false);
-        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        try { wl = ((PowerManager) getSystemService(POWER_SERVICE)).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "vc:job"); wl.acquire(6 * 3600_000L); } catch (Exception ignored) {}
-        worker = new Thread(() -> {
-            for (Job j : jobs) {
-                if (stopAll) break;
-                if (j.state != 0 || j.probe == null) continue;
-                process(j, s);
-            }
-            runOnUiThread(() -> {
-                worker = null; btnStart.setEnabled(true); btnCancel.setEnabled(false); btnPick.setEnabled(true);
-                getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-                try { if (wl != null && wl.isHeld()) wl.release(); } catch (Exception ignored) {}
-                updateSummary(); toast("队列处理结束");
-            });
-        });
-        worker.start();
+        if (Engine.running) return;
+        boolean any = false; for (Engine.Job j : jobs) if (j.state == Engine.WAIT && j.probe != null) any = true;
+        if (!any) { toast("请先选择视频（或等待读取完成）"); return; }
+        Engine.settings = settings();
+        AppLog.i("预设=" + Engine.settings.preset + " 编码=" + Engine.settings.codec + " 短边=" + Engine.settings.maxShort);
+        VcService.start(this);
+        btnStart.setEnabled(false); btnCancel.setEnabled(true); btnPick.setEnabled(false);
     }
 
     private void cancel() {
-        stopAll = true; Transcoder t = current; if (t != null) t.cancel();
-        toast("正在取消…");
-    }
-
-    private void ui(Job j, String text, int color) { runOnUiThread(() -> { j.tv.setText(text); j.tv.setTextColor(color); }); }
-
-    private void process(Job j, Transcoder.Settings s) {
-        Transcoder.Probe p = j.probe;
-        Transcoder.Plan pl;
-        try { pl = Transcoder.plan(p, s); } catch (Exception e) { j.state = 4; ui(j, j.name + "\n❌ " + e.getMessage(), 0xFFC62828); return; }
-        if (BitrateCalc.shouldSkip(pl.estBytes, p.size)) {
-            j.state = 3; ui(j, j.name + "\n⏭ 已跳过：预计输出 " + BitrateCalc.human(pl.estBytes) + " 不小于原文件 " + BitrateCalc.human(p.size) + "，无需重新编码。", 0xFFEF6C00); return;
-        }
-        j.state = 1;
-        final String head = j.name + "\n" + CodecSupport.label(pl.mime) + " · " + pl.encName + " · " + pl.w + "×" + pl.h + " · "
-                + String.format(Locale.CHINA, "%.2f Mbps", pl.vBps / 1e6) + " · 预计 " + BitrateCalc.human(pl.estBytes);
-        ui(j, head + "\n压缩中… 0%", 0xFF1565C0);
-        File tmp = new File(getCacheDir(), "out_" + System.nanoTime() + ".mp4");
-        Transcoder t = new Transcoder(); current = t;
-        long t0 = System.currentTimeMillis();
-        try {
-            t.run(this, j.uri, p, pl, tmp, prog -> runOnUiThread(() -> {
-                j.pb.setProgress((int) (prog * 1000));
-                long el = System.currentTimeMillis() - t0;
-                String eta = prog > 0.02 ? "，剩余约 " + Math.max(1, Math.round(el * (1 - prog) / prog / 1000)) + " 秒" : "";
-                j.tv.setText(head + String.format(Locale.CHINA, "\n压缩中… %.0f%%%s", prog * 100, eta));
-            }));
-            long outSize = tmp.length();
-            if (outSize <= 0) throw new IOException("输出为空");
-            if (outSize >= p.size) {
-                j.state = 3; ui(j, j.name + "\n⏭ 压缩后 " + BitrateCalc.human(outSize) + " 不小于原文件 " + BitrateCalc.human(p.size) + "，已放弃保存，原视频保持不变。", 0xFFEF6C00);
-                return;
-            }
-            String outName = baseName(j.name) + "_" + tag(pl.mime) + ".mp4";
-            String where = save(tmp, outName);
-            j.outSize = outSize; j.state = 2;
-            double secs = (System.currentTimeMillis() - t0) / 1000.0;
-            ui(j, String.format(Locale.CHINA, "%s\n✅ 完成：%s → %s（%s）\n%s %d×%d · 用时 %.0f 秒\n已保存：%s", j.name,
-                    BitrateCalc.human(p.size), BitrateCalc.human(outSize), pct(outSize, p.size), CodecSupport.label(pl.mime), pl.w, pl.h, secs, where), 0xFF2E7D32);
-            runOnUiThread(() -> j.pb.setProgress(1000));
-        } catch (InterruptedException e) {
-            j.state = 5; ui(j, j.name + "\n已取消", 0xFF757575);
-        } catch (Throwable e) {
-            j.state = 4; ui(j, j.name + "\n❌ 转换失败：" + friendly(e), 0xFFC62828);
-        } finally {
-            current = null; tmp.delete();
-            runOnUiThread(this::updateSummary);
-        }
+        Engine.cancel(); toast("正在取消…（最多 5 秒）");
     }
 
     static String friendly(Throwable e) {
@@ -324,38 +299,6 @@ public class MainActivity extends Activity {
 
     static String tag(String mime) { return BitrateCalc.HEVC.equals(mime) ? "hevc" : BitrateCalc.AV1.equals(mime) ? "av1" : "h264"; }
     static String baseName(String n) { int i = n.lastIndexOf('.'); return (i > 0 ? n.substring(0, i) : n).replaceAll("[\\\\/:*?\"<>|]", "_"); }
-
-    private String save(File src, String name) throws IOException {
-        ContentResolver cr = getContentResolver();
-        if (Build.VERSION.SDK_INT >= 29) {
-            ContentValues v = new ContentValues();
-            v.put(MediaStore.Video.Media.DISPLAY_NAME, name);
-            v.put(MediaStore.Video.Media.MIME_TYPE, "video/mp4");
-            v.put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/" + OUT_DIR);
-            v.put(MediaStore.Video.Media.IS_PENDING, 1);
-            Uri u = cr.insert(MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), v);
-            if (u == null) throw new IOException("无法在相册创建文件");
-            try (InputStream in = new FileInputStream(src); OutputStream out = cr.openOutputStream(u)) { copy(in, out); }
-            catch (IOException e) { cr.delete(u, null, null); throw e; }
-            v.clear(); v.put(MediaStore.Video.Media.IS_PENDING, 0); cr.update(u, v, null, null);
-            return "Movies/" + OUT_DIR + "/" + name;
-        } else {
-            if (checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
-                runOnUiThread(() -> requestPermissions(new String[]{android.Manifest.permission.WRITE_EXTERNAL_STORAGE}, 2));
-                throw new IOException("需要存储权限，请授权后重试");
-            }
-            File dir = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES), OUT_DIR); dir.mkdirs();
-            File f = new File(dir, name); int k = 1;
-            while (f.exists()) f = new File(dir, baseName(name) + "(" + (k++) + ").mp4");
-            try (InputStream in = new FileInputStream(src); OutputStream out = new FileOutputStream(f)) { copy(in, out); }
-            android.media.MediaScannerConnection.scanFile(this, new String[]{f.getAbsolutePath()}, null, null);
-            return f.getAbsolutePath();
-        }
-    }
-
-    static void copy(InputStream in, OutputStream out) throws IOException {
-        byte[] b = new byte[1 << 16]; int n; while ((n = in.read(b)) > 0) out.write(b, 0, n);
-    }
 
     private void toast(String s) { Toast.makeText(this, s, Toast.LENGTH_SHORT).show(); }
 }

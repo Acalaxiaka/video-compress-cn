@@ -37,11 +37,10 @@ public final class Transcoder {
         public String mime, encName; public int w, h; public long vBps, aBps, estBytes; public boolean audioCopy;
     }
 
-    public interface Listener { void onProgress(float p); }
     public static class TranscodeException extends Exception { public TranscodeException(String m) { super(m); } }
 
     private volatile boolean canceled;
-    public void cancel() { canceled = true; }
+    public void cancel() { abort(); }
 
     // ---------- 探测 ----------
     public static Probe probe(Context ctx, Uri uri, long size) throws TranscodeException {
@@ -140,162 +139,374 @@ public final class Transcoder {
         return pl;
     }
 
-    // ---------- 转码 ----------
-    private static final long TO = 10_000;
+    // ---------- 转码（异步 MediaCodec + 看门狗） ----------
+    /** 单个输出分段（MP4 32 位偏移上限约 4 GB，超过 SEG_LIMIT 自动切分为多个文件）。 */
+    public static abstract class Seg {
+        public abstract MediaMuxer createMuxer() throws java.io.IOException;
+        public abstract void commit(String suffix) throws java.io.IOException;
+        public abstract void discard();
+        public abstract String where();
+        public long bytes;
+    }
+    public interface Sink { Seg open(int index) throws java.io.IOException; }
+    public interface Listener { void onProgress(float p); }
+    public static final class Result { public final List<Seg> segs = new ArrayList<>(); public long bytes; public boolean partial; public String partialReason; }
+
+    public static long SEG_LIMIT = 3_500_000_000L;   // 留足 moov 空间，低于 4 GiB
+    public static long STALL_MS = 20_000;
+
+    private final Object mx = new Object(), gate = new Object();
     private MediaMuxer muxer; private boolean muxStarted; private int vTrack = -1, aTrack = -1;
+    private MediaFormat vOutFmt, aOutFmt; private boolean needAudio;
     private final List<Object[]> pending = new ArrayList<>();
-    private boolean needAudio;
+    private final Result result = new Result(); private Seg seg; private Sink sink; private int rotation;
+    private volatile boolean rollRequested, videoDone, audioDone, decEos, rendering, failedFlag;
+    private volatile Throwable error; private volatile long lastProgressMs, lastVideoPts = -1, lastRenderPts = -1, framesIn, framesOut, framesEnc;
+    private volatile String stage = "init";
+    private final java.util.ArrayDeque<long[]> decQ = new java.util.ArrayDeque<>();
+    private MediaCodec dec, enc, aDec, aEnc; private MediaExtractor vEx, aEx;
+    private InputSurface inS; private OutputSurface outS; private HandlerThread glT, encT, audT; private Handler glH;
+    private Thread audioThread;
 
-    public void run(Context ctx, Uri uri, Probe p, Plan pl, File out, Listener l) throws Exception {
-        MediaExtractor vEx = new MediaExtractor(), aEx = null;
-        MediaCodec dec = null, enc = null, aDec = null, aEnc = null;
-        InputSurface inS = null; OutputSurface outS = null;
+    private void fail(Throwable t) { if (error == null) error = t; failedFlag = true; AppLog.w("错误：" + t); }
+    private void touch() { lastProgressMs = System.currentTimeMillis(); }
+
+    public String diag() {
+        return "stage=" + stage + " in=" + framesIn + " dec->gl=" + framesOut + " enc=" + framesEnc + " decQ=" + decQ.size() + " rendering=" + rendering
+                + " decEos=" + decEos + " videoDone=" + videoDone + " audioDone=" + audioDone + " lastVPts=" + lastVideoPts / 1000 + "ms"
+                + " seg#" + result.segs.size() + " segBytes=" + (seg != null ? seg.bytes : 0) + " muxStarted=" + muxStarted;
+    }
+
+    public Result run(Context ctx, Uri uri, Probe p, Plan pl, Sink sink, Listener l) throws Exception {
+        this.sink = sink; this.rotation = ((p.rotation % 360) + 360) % 360;
+        touch();
         try {
-            vEx.setDataSource(ctx, uri, null);
-            int vt = selectTrack(vEx, "video/");
-            MediaFormat vf = vEx.getTrackFormat(vt); vEx.selectTrack(vt);
+            vEx = new MediaExtractor(); vEx.setDataSource(ctx, uri, null);
+            int vt = selectTrack(vEx, "video/"); MediaFormat vf = vEx.getTrackFormat(vt); vEx.selectTrack(vt);
+            needAudio = p.hasAudio;
+            MediaFormat af = null;
+            if (needAudio) {
+                aEx = new MediaExtractor(); aEx.setDataSource(ctx, uri, null);
+                int at = selectTrack(aEx, "audio/"); af = aEx.getTrackFormat(at); aEx.selectTrack(at);
+                if (pl.audioCopy) aOutFmt = af;
+                else if (findDecoder(af) == null) { needAudio = false; AppLog.w("音频无法解码，输出无声视频"); }
+            }
+            seg = sink.open(0); result.segs.add(seg);
+            muxer = seg.createMuxer(); muxer.setOrientationHint(rotation);
+            if (needAudio && pl.audioCopy) aTrack = muxer.addTrack(aOutFmt);
 
-            MediaFormat ef = MediaFormat.createVideoFormat(pl.mime, pl.w, pl.h);
-            ef.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface);
-            ef.setInteger(MediaFormat.KEY_BIT_RATE, (int) Math.min(Integer.MAX_VALUE, pl.vBps));
-            ef.setInteger(MediaFormat.KEY_FRAME_RATE, (int) Math.max(1, Math.round(p.fps)));
-            ef.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2);
-            enc = MediaCodec.createByCodecName(pl.encName);
-            try {
-                MediaCodecInfo.EncoderCapabilities ec = enc.getCodecInfo().getCapabilitiesForType(pl.mime).getEncoderCapabilities();
-                if (ec.isBitrateModeSupported(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR))
-                    ef.setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR);
-            } catch (Exception ignored) {}
+            glT = new HandlerThread("vc-gl"); glT.start(); glH = new Handler(glT.getLooper());
+            encT = new HandlerThread("vc-enc"); encT.start(); Handler encH = new Handler(encT.getLooper());
+            final MediaFormat fvf = vf;
+            stage = "setup";
+            Object setup = runOn(glH, 10_000, () -> { setupVideo(fvf, pl, p, encH, l); return null; });
+            if (setup instanceof Throwable) throw new TranscodeException("初始化编解码器失败 [E-INIT]：" + setup);
+
+            if (needAudio) {
+                final MediaFormat faf = af;
+                audioThread = new Thread(() -> {
+                    try { if (pl.audioCopy) copyAudio(faf); else reencodeAudio(faf, pl); }
+                    catch (Throwable t) { if (!canceled) fail(t); }
+                    finally { audioDone = true; }
+                }, "vc-audio");
+                audioThread.start();
+            } else audioDone = true;
+
+            stage = "running";
+            // 控制线程：只做带超时的等待，永不阻塞在编解码调用上
+            while (true) {
+                synchronized (gate) { gate.wait(300); }
+                if (canceled) throw new InterruptedException("canceled");
+                if (failedFlag) throw new TranscodeException("编解码出错 [E-CODEC]：" + error);
+                if (videoDone && audioDone) break;
+                long idle = System.currentTimeMillis() - lastProgressMs;
+                if (idle > STALL_MS) {
+                    AppLog.w("看门狗：" + (idle / 1000) + " 秒无进展。" + diag());
+                    result.partial = true;
+                    result.partialReason = String.format(java.util.Locale.CHINA, "处理在 %.0f%% 处停滞超过 %d 秒 [E-STALL]", p.durUs > 0 ? 100.0 * Math.max(0, lastVideoPts) / p.durUs : 0, STALL_MS / 1000);
+                    break;
+                }
+            }
+            stage = result.partial ? "finalize-partial" : "finalize";
+            if (!finishMuxer(8_000)) {
+                throw new TranscodeException((result.partial ? result.partialReason + "，且" : "") + "无法完成写入文件（复用器无响应）[E-MUX]。" + diag());
+            }
+            if (l != null && !result.partial) l.onProgress(1f);
+            for (Seg s : result.segs) result.bytes += s.bytes;
+            return result;
+        } finally {
+            teardown(5_000);
+        }
+    }
+
+    /** 外部（看门狗/取消）可随时调用：在独立线程中释放资源，最多等待 timeout。 */
+    public void abort() { canceled = true; synchronized (gate) { gate.notifyAll(); } }
+
+    private void setupVideo(MediaFormat vf, Plan pl, Probe p, Handler encH, Listener l) throws Exception {
+        MediaFormat ef = encoderFormat(pl, p, true);
+        enc = MediaCodec.createByCodecName(pl.encName);
+        MediaCodec.Callback encCb = new MediaCodec.Callback() {
+            public void onInputBufferAvailable(MediaCodec c, int i) {}
+            public void onOutputBufferAvailable(MediaCodec c, int i, MediaCodec.BufferInfo info) {
+                try {
+                    ByteBuffer b = c.getOutputBuffer(i);
+                    boolean eos = (info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0;
+                    if ((info.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0 && info.size > 0 && b != null) {
+                        writeSample(true, b, info); framesEnc++; lastVideoPts = info.presentationTimeUs;
+                    }
+                    c.releaseOutputBuffer(i, false);
+                    if (eos) { videoDone = true; AppLog.i("视频编码结束，帧数 " + framesEnc); synchronized (gate) { gate.notifyAll(); } }
+                } catch (Throwable t) { if (!canceled) fail(t); }
+            }
+            public void onError(MediaCodec c, MediaCodec.CodecException e) { if (!canceled) fail(e); }
+            public void onOutputFormatChanged(MediaCodec c, MediaFormat f) { synchronized (mx) { vOutFmt = f; vTrack = muxer.addTrack(f); maybeStart(); } }
+        };
+        enc.setCallback(encCb, encH);
+        try { enc.configure(ef, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE); }
+        catch (Exception e) {
+            AppLog.w("编码器不接受扩展参数（profile/priority/operating-rate），使用基本参数重试：" + e);
+            enc.reset(); enc.setCallback(encCb, encH);
+            enc.configure(encoderFormat(pl, p, false), null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
+        }
+        AppLog.i("编码器 " + pl.encName + " " + pl.w + "x" + pl.h + " " + pl.vBps / 1000 + "kbps");
+        inS = new InputSurface(enc.createInputSurface()); inS.makeCurrent();
+        outS = new OutputSurface(pl.w, pl.h, glH, this::onFrame);
+        dec = MediaCodec.createByCodecName(findDecoder(vf));
+        dec.setCallback(new MediaCodec.Callback() {
+            public void onInputBufferAvailable(MediaCodec c, int i) {
+                if (canceled || decEos) return;
+                try {
+                    ByteBuffer b = c.getInputBuffer(i);
+                    int n = vEx.readSampleData(b, 0);
+                    if (n < 0) { c.queueInputBuffer(i, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM); decEos = true; AppLog.i("视频读取完毕，共 " + framesIn + " 帧"); }
+                    else { c.queueInputBuffer(i, 0, n, vEx.getSampleTime(), 0); vEx.advance(); framesIn++; }
+                } catch (Throwable t) { if (!canceled) fail(t); }
+            }
+            public void onOutputBufferAvailable(MediaCodec c, int i, MediaCodec.BufferInfo info) {
+                boolean eos = (info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0;
+                decQ.add(new long[]{i, info.presentationTimeUs, info.size > 0 ? 1 : 0, eos ? 1 : 0});
+                pump();
+            }
+            public void onError(MediaCodec c, MediaCodec.CodecException e) { if (!canceled) fail(e); }
+            public void onOutputFormatChanged(MediaCodec c, MediaFormat f) {}
+        }, glH);
+        MediaFormat dvf = new MediaFormat(vf);
+        if (Build.VERSION.SDK_INT >= 23) { dvf.setInteger(MediaFormat.KEY_PRIORITY, 1); }
+        dec.configure(dvf, outS.surface, null, 0);
+        enc.start(); dec.start();
+        this.listener = l; this.durUs = p.durUs;
+    }
+    private Listener listener; private long durUs; private long renderStartMs;
+
+    /** 一次只把一帧送到 SurfaceTexture，确保不丢帧、无背压死锁；带 3 秒丢帧超时。 */
+    private void pump() {
+        if (canceled || rendering) return;
+        while (!decQ.isEmpty()) {
+            long[] f = decQ.poll();
+            int idx = (int) f[0]; boolean render = f[2] == 1, eos = f[3] == 1;
+            try { dec.releaseOutputBuffer(idx, render); } catch (Throwable t) { if (!canceled) fail(t); return; }
+            if (render) {
+                rendering = true; pendingPts = f[1]; pendingEos = eos; renderStartMs = System.currentTimeMillis();
+                final long token = ++renderToken;
+                glH.postDelayed(() -> { if (rendering && renderToken == token) { AppLog.w("帧回调超时，跳过一帧 pts=" + pendingPts / 1000 + "ms"); rendering = false; if (pendingEos) endVideoInput(); else pump(); } }, 3000);
+                return;
+            }
+            if (eos) { endVideoInput(); return; }
+        }
+    }
+    private long pendingPts, renderToken; private boolean pendingEos, inputEnded;
+
+    private void onFrame() {
+        if (canceled || !rendering) { try { outS.latch(); } catch (Throwable ignored) {} return; }
+        try {
+            outS.latch(); outS.drawImage();
+            long pts = Math.max(pendingPts, lastRenderPts + 1); // 保证时间戳单调递增
+            lastRenderPts = pts;
+            inS.setPresentationTime(pts * 1000); inS.swapBuffers();
+            framesOut++; touch();
+            if (listener != null && durUs > 0 && (framesOut % 10 == 0)) listener.onProgress(Math.min(0.995f, pts / (float) durUs));
+        } catch (Throwable t) { if (!canceled) fail(t); }
+        rendering = false;
+        if (pendingEos) endVideoInput(); else pump();
+    }
+
+    private void endVideoInput() {
+        if (inputEnded) return; inputEnded = true;
+        try { enc.signalEndOfInputStream(); AppLog.i("已向编码器发送 EOS"); } catch (Throwable t) { if (!canceled) fail(t); }
+    }
+
+    private MediaFormat encoderFormat(Plan pl, Probe p, boolean extras) {
+        MediaFormat ef = MediaFormat.createVideoFormat(pl.mime, pl.w, pl.h);
+        ef.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface);
+        ef.setInteger(MediaFormat.KEY_BIT_RATE, (int) Math.min(Integer.MAX_VALUE, pl.vBps));
+        ef.setInteger(MediaFormat.KEY_FRAME_RATE, (int) Math.max(1, Math.round(p.fps)));
+        ef.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2);
+        try {
+            MediaCodecInfo.EncoderCapabilities ec = CodecSupport.byName(pl.encName).getCapabilitiesForType(pl.mime).getEncoderCapabilities();
+            if (ec.isBitrateModeSupported(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR))
+                ef.setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR);
+        } catch (Exception ignored) {}
+        if (extras) {
             if (BitrateCalc.HEVC.equals(pl.mime)) ef.setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.HEVCProfileMain);
             if (BitrateCalc.AVC.equals(pl.mime)) ef.setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileHigh);
-            try { enc.configure(ef, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE); }
-            catch (Exception e) { // 部分设备不接受 profile 指定，去掉重试
-                ef.setString(MediaFormat.KEY_PROFILE, null); ef = stripProfile(ef);
-                enc.reset(); enc.configure(ef, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
-            }
-            inS = new InputSurface(enc.createInputSurface()); inS.makeCurrent();
-            enc.start();
-            outS = new OutputSurface(pl.w, pl.h);
-            dec = MediaCodec.createByCodecName(findDecoder(vf));
-            dec.configure(vf, outS.surface, null, 0); dec.start();
-
-            muxer = new MediaMuxer(out.getAbsolutePath(), MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
-            muxer.setOrientationHint(((p.rotation % 360) + 360) % 360);
-
-            // 音频
-            int at = -1; MediaFormat af = null;
-            if (p.hasAudio) {
-                aEx = new MediaExtractor(); aEx.setDataSource(ctx, uri, null);
-                at = selectTrack(aEx, "audio/"); af = aEx.getTrackFormat(at); aEx.selectTrack(at);
-                needAudio = true;
-                if (pl.audioCopy) {
-                    aTrack = muxer.addTrack(af);
-                } else {
-                    String adn = findDecoder(af);
-                    if (adn == null) { needAudio = false; aEx.release(); aEx = null; } // 音频不可解码：输出无声视频
-                    else {
-                        aDec = MediaCodec.createByCodecName(adn); aDec.configure(af, null, null, 0); aDec.start();
-                        int sr = af.getInteger(MediaFormat.KEY_SAMPLE_RATE), ch = Math.min(2, af.getInteger(MediaFormat.KEY_CHANNEL_COUNT));
-                        MediaFormat aef = MediaFormat.createAudioFormat("audio/mp4a-latm", sr, ch);
-                        aef.setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC);
-                        aef.setInteger(MediaFormat.KEY_BIT_RATE, (int) pl.aBps);
-                        aef.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 1 << 16);
-                        aEnc = MediaCodec.createEncoderByType("audio/mp4a-latm");
-                        aEnc.configure(aef, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE); aEnc.start();
-                        srcChannels = af.getInteger(MediaFormat.KEY_CHANNEL_COUNT); outChannels = ch; sampleRate = sr;
-                    }
-                }
-            }
-
-            MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
-            boolean exDone = false, decDone = false, encDone = false;
-            boolean aExDone = !needAudio, aDecDone = !needAudio || pl.audioCopy, aEncDone = !needAudio;
-            ByteBuffer copyBuf = ByteBuffer.allocateDirect(af != null && af.containsKey(MediaFormat.KEY_MAX_INPUT_SIZE) ? Math.max(1 << 16, af.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE)) : 1 << 20);
-            long lastVPts = 0, aPts = 0;
-            long lastProg = 0;
-
-            while (!encDone || !aEncDone) {
-                if (canceled) throw new InterruptedException("canceled");
-                // --- 视频：送入解码器
-                if (!exDone) {
-                    int ii = dec.dequeueInputBuffer(TO);
-                    if (ii >= 0) {
-                        ByteBuffer b = dec.getInputBuffer(ii);
-                        int n = vEx.readSampleData(b, 0);
-                        if (n < 0) { dec.queueInputBuffer(ii, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM); exDone = true; }
-                        else { dec.queueInputBuffer(ii, 0, n, vEx.getSampleTime(), 0); vEx.advance(); }
-                    }
-                }
-                // --- 视频：解码输出 → GL → 编码器
-                if (!decDone) {
-                    int oi = dec.dequeueOutputBuffer(info, TO);
-                    if (oi >= 0) {
-                        boolean render = info.size > 0;
-                        boolean eos = (info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0;
-                        long pts = info.presentationTimeUs;
-                        dec.releaseOutputBuffer(oi, render);
-                        if (render) {
-                            outS.awaitNewImage(); outS.drawImage();
-                            inS.setPresentationTime(pts * 1000); inS.swapBuffers();
-                            lastVPts = pts;
-                            if (l != null && p.durUs > 0 && System.currentTimeMillis() - lastProg > 200) {
-                                lastProg = System.currentTimeMillis(); l.onProgress(Math.min(0.99f, pts / (float) p.durUs));
-                            }
-                        }
-                        if (eos) { enc.signalEndOfInputStream(); decDone = true; }
-                    }
-                }
-                // --- 视频：编码输出 → 复用器
-                if (!encDone) {
-                    int oi = enc.dequeueOutputBuffer(info, decDone ? TO : 0);
-                    if (oi == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) { vTrack = muxer.addTrack(enc.getOutputFormat()); maybeStart(); }
-                    else if (oi >= 0) {
-                        ByteBuffer b = enc.getOutputBuffer(oi);
-                        if ((info.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) info.size = 0;
-                        if (info.size > 0) write(vTrack, b, info);
-                        if ((info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) encDone = true;
-                        enc.releaseOutputBuffer(oi, false);
-                    }
-                }
-                // --- 音频（按视频时间轴交错，避免内存堆积）
-                boolean audioTurn = encDone || aPts <= lastVPts + 500_000;
-                if (needAudio && pl.audioCopy && !aEncDone && audioTurn && muxStarted) {
-                    int n = aEx.readSampleData(copyBuf, 0);
-                    if (n < 0) { aEncDone = true; }
-                    else {
-                        MediaCodec.BufferInfo ai = new MediaCodec.BufferInfo();
-                        aPts = aEx.getSampleTime();
-                        int fl = (aEx.getSampleFlags() & MediaExtractor.SAMPLE_FLAG_SYNC) != 0 ? MediaCodec.BUFFER_FLAG_KEY_FRAME : 0;
-                        ai.set(0, n, aPts, fl); muxer.writeSampleData(aTrack, copyBuf, ai); aEx.advance();
-                    }
-                } else if (needAudio && !pl.audioCopy && !aEncDone) {
-                    if (!aExDone && audioTurn) {
-                        int ii = aDec.dequeueInputBuffer(0);
-                        if (ii >= 0) {
-                            int n = aEx.readSampleData(aDec.getInputBuffer(ii), 0);
-                            if (n < 0) { aDec.queueInputBuffer(ii, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM); aExDone = true; }
-                            else { aPts = aEx.getSampleTime(); aDec.queueInputBuffer(ii, 0, n, aPts, 0); aEx.advance(); }
-                        }
-                    }
-                    pumpAudio(aDec, aEnc);
-                    int oi = aEnc.dequeueOutputBuffer(info, 0);
-                    if (oi == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) { aTrack = muxer.addTrack(aEnc.getOutputFormat()); maybeStart(); }
-                    else if (oi >= 0) {
-                        ByteBuffer b = aEnc.getOutputBuffer(oi);
-                        if ((info.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) info.size = 0;
-                        if (info.size > 0) write(aTrack, b, info);
-                        if ((info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) aEncDone = true;
-                        aEnc.releaseOutputBuffer(oi, false);
-                    }
-                }
-            }
-            if (l != null) l.onProgress(1f);
-        } finally {
-            rel(dec); rel(enc); rel(aDec); rel(aEnc);
-            if (inS != null) inS.release(); if (outS != null) outS.release();
-            vEx.release(); if (aEx != null) aEx.release();
-            if (muxer != null) { try { if (muxStarted) muxer.stop(); } catch (Exception ignored) {} try { muxer.release(); } catch (Exception ignored) {} }
+            // 非实时、尽可能快
+            ef.setInteger(MediaFormat.KEY_PRIORITY, 1);
+            ef.setInteger(MediaFormat.KEY_OPERATING_RATE, Short.MAX_VALUE);
         }
+        return ef;
+    }
+
+    // ---- 复用器（线程安全；分段；记录进度） ----
+    private void maybeStart() {
+        if (muxStarted || vTrack < 0 || (needAudio && aTrack < 0)) return;
+        muxer.start(); muxStarted = true; AppLog.i("复用器启动");
+        for (Object[] o : pending) { MediaCodec.BufferInfo bi = (MediaCodec.BufferInfo) o[2]; muxer.writeSampleData((Boolean) o[0] ? vTrack : aTrack, (ByteBuffer) o[1], bi); seg.bytes += bi.size; }
+        pending.clear();
+    }
+
+    private void writeSample(boolean video, ByteBuffer b, MediaCodec.BufferInfo info) throws Exception {
+        if (canceled) return;
+        synchronized (mx) {
+            if (muxer == null) return;
+            b.position(info.offset); b.limit(info.offset + info.size);
+            if (!muxStarted) {
+                ByteBuffer c = ByteBuffer.allocateDirect(info.size); c.put(b); c.flip();
+                MediaCodec.BufferInfo i2 = new MediaCodec.BufferInfo(); i2.set(0, info.size, info.presentationTimeUs, info.flags);
+                pending.add(new Object[]{video, c, i2}); touch(); return;
+            }
+            if (video && rollRequested && (info.flags & MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0) roll();
+            muxer.writeSampleData(video ? vTrack : aTrack, b, info);
+            seg.bytes += info.size; touch();
+            if (video && !rollRequested && seg.bytes > SEG_LIMIT) {
+                rollRequested = true; AppLog.i("分段达到 " + BitrateCalc.human(seg.bytes) + "，请求关键帧以切分（MP4 4GB 限制）");
+                android.os.Bundle bd = new android.os.Bundle(); bd.putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0);
+                try { enc.setParameters(bd); } catch (Exception ignored) {}
+            }
+        }
+        synchronized (gate) { gate.notifyAll(); }
+    }
+
+    private void roll() throws Exception {
+        muxer.stop(); muxer.release();
+        AppLog.i("分段 " + result.segs.size() + " 完成：" + BitrateCalc.human(seg.bytes));
+        seg = sink.open(result.segs.size()); result.segs.add(seg);
+        muxer = seg.createMuxer(); muxer.setOrientationHint(rotation);
+        vTrack = muxer.addTrack(vOutFmt);
+        if (needAudio) aTrack = muxer.addTrack(aOutFmt);
+        muxer.start(); rollRequested = false;
+    }
+
+    /** 在独立线程中结束复用器，超时则放弃（避免卡死）。 */
+    private boolean finishMuxer(long timeoutMs) {
+        // 先停编解码器，避免回调继续写入
+        stopCodecs(3000);
+        final boolean[] ok = {false};
+        Thread t = new Thread(() -> {
+            synchronized (mx) {
+                try { if (muxStarted) { muxer.stop(); ok[0] = true; } else ok[0] = false; } catch (Throwable e) { AppLog.w("muxer.stop 失败：" + e); }
+                try { muxer.release(); } catch (Throwable ignored) {}
+                muxer = null;
+            }
+        }, "vc-mux-stop");
+        t.setDaemon(true); t.start();
+        try { t.join(timeoutMs); } catch (InterruptedException ignored) {}
+        if (t.isAlive()) { AppLog.w("muxer.stop 超时（可能复用器内部阻塞）"); return false; }
+        return ok[0];
+    }
+
+    private void stopCodecs(long timeoutMs) {
+        final MediaCodec d = dec, e = enc, ad = aDec, ae = aEnc;
+        Thread t = new Thread(() -> { stop(d); stop(e); stop(ad); stop(ae); }, "vc-stop");
+        t.setDaemon(true); t.start();
+        try { t.join(timeoutMs); } catch (InterruptedException ignored) {}
+        if (t.isAlive()) AppLog.w("停止编解码器超时，强制继续");
+    }
+    private static void stop(MediaCodec c) { if (c != null) try { c.stop(); } catch (Throwable ignored) {} }
+
+    private void teardown(long timeoutMs) {
+        canceled = true;
+        synchronized (gate) { gate.notifyAll(); }
+        Thread t = new Thread(() -> {
+            stopCodecs(2000);
+            rel(dec); rel(enc); rel(aDec); rel(aEnc);
+            if (glH != null) runOn(glH, 2000, () -> { if (outS != null) outS.release(); if (inS != null) inS.release(); return null; });
+            try { if (vEx != null) vEx.release(); } catch (Throwable ignored) {}
+            try { if (aEx != null) aEx.release(); } catch (Throwable ignored) {}
+            if (glT != null) glT.quitSafely(); if (encT != null) encT.quitSafely();
+        }, "vc-teardown");
+        t.setDaemon(true); t.start();
+        try { t.join(timeoutMs); } catch (InterruptedException ignored) {}
+        if (t.isAlive()) AppLog.w("资源释放超时，已放弃等待（后台线程将自行结束）");
+        if (audioThread != null) audioThread.interrupt();
+        // 若复用器仍未释放（异常路径），尝试在后台释放
+        final MediaMuxer m = muxer; muxer = null;
+        if (m != null) { Thread r = new Thread(() -> { try { m.release(); } catch (Throwable ignored) {} }); r.setDaemon(true); r.start(); }
+    }
+
+    private static Object runOn(Handler h, long timeoutMs, java.util.concurrent.Callable<Object> c) {
+        final Object[] res = {null}; final java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
+        if (!h.post(() -> { try { res[0] = c.call(); } catch (Throwable t) { res[0] = t; } latch.countDown(); })) return new RuntimeException("线程已退出");
+        try { if (!latch.await(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)) return new RuntimeException("超时"); }
+        catch (InterruptedException e) { return e; }
+        return res[0];
+    }
+
+    // ---- 音频：独立线程，按视频时间轴交错（最多领先 1 秒），所有等待带超时 ----
+    private void waitAudioTurn(long aPts) throws InterruptedException {
+        while (!canceled && !failedFlag && !videoDone && (!muxStarted || aPts > lastVideoPts + 1_000_000)) {
+            if (result.partial) return;
+            synchronized (gate) { gate.wait(50); }
+        }
+    }
+
+    private void copyAudio(MediaFormat af) throws Exception {
+        int cap = af.containsKey(MediaFormat.KEY_MAX_INPUT_SIZE) ? Math.max(1 << 16, af.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE)) : 1 << 20;
+        ByteBuffer buf = ByteBuffer.allocateDirect(cap); MediaCodec.BufferInfo ai = new MediaCodec.BufferInfo();
+        while (!canceled && !failedFlag) {
+            int n = aEx.readSampleData(buf, 0);
+            if (n < 0) break;
+            long pts = aEx.getSampleTime();
+            waitAudioTurn(pts);
+            if (canceled || stageIsFinal()) break;
+            int fl = (aEx.getSampleFlags() & MediaExtractor.SAMPLE_FLAG_SYNC) != 0 ? MediaCodec.BUFFER_FLAG_KEY_FRAME : 0;
+            ai.set(0, n, pts, fl); writeSample(false, buf, ai); aEx.advance();
+        }
+        AppLog.i("音频复制完成");
+    }
+    private boolean stageIsFinal() { return stage.startsWith("finalize"); }
+
+    private void reencodeAudio(MediaFormat af, Plan pl) throws Exception {
+        aDec = MediaCodec.createByCodecName(findDecoder(af)); aDec.configure(af, null, null, 0); aDec.start();
+        sampleRate = af.getInteger(MediaFormat.KEY_SAMPLE_RATE); srcChannels = af.getInteger(MediaFormat.KEY_CHANNEL_COUNT); outChannels = Math.min(2, srcChannels);
+        MediaFormat aef = MediaFormat.createAudioFormat("audio/mp4a-latm", sampleRate, outChannels);
+        aef.setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC);
+        aef.setInteger(MediaFormat.KEY_BIT_RATE, (int) pl.aBps); aef.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 1 << 16);
+        aEnc = MediaCodec.createEncoderByType("audio/mp4a-latm"); aEnc.configure(aef, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE); aEnc.start();
+        MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+        boolean exDone = false; long aPts = 0;
+        while (!canceled && !failedFlag && !stageIsFinal()) {
+            if (!exDone) {
+                if (aOutFmt != null) waitAudioTurn(aPts); // 格式未知前不等待，避免与复用器启动互相等待
+                int ii = aDec.dequeueInputBuffer(5_000);
+                if (ii >= 0) {
+                    int n = aEx.readSampleData(aDec.getInputBuffer(ii), 0);
+                    if (n < 0) { aDec.queueInputBuffer(ii, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM); exDone = true; }
+                    else { aPts = aEx.getSampleTime(); aDec.queueInputBuffer(ii, 0, n, aPts, 0); aEx.advance(); }
+                }
+            }
+            pumpAudio(aDec, aEnc);
+            int oi = aEnc.dequeueOutputBuffer(info, 5_000);
+            if (oi == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) { synchronized (mx) { aOutFmt = aEnc.getOutputFormat(); aTrack = muxer.addTrack(aOutFmt); maybeStart(); } }
+            else if (oi >= 0) {
+                ByteBuffer b = aEnc.getOutputBuffer(oi);
+                if ((info.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) info.size = 0;
+                boolean eos = (info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0;
+                if (info.size > 0) writeSample(false, b, info);
+                aEnc.releaseOutputBuffer(oi, false);
+                if (eos) break;
+            }
+        }
+        AppLog.i("音频重编码完成");
     }
 
     // 音频 PCM 搬运：解码器输出 → 编码器输入（可能下混为双声道）
@@ -305,7 +516,7 @@ public final class Transcoder {
     private void pumpAudio(MediaCodec aDec, MediaCodec aEnc) {
         if (aDecEosSent) return;
         if (pendIdx < 0) {
-            int oi = aDec.dequeueOutputBuffer(pendInfo, 0);
+            int oi = aDec.dequeueOutputBuffer(pendInfo, 5_000);
             if (oi == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                 MediaFormat f = aDec.getOutputFormat();
                 if (f.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) srcChannels = f.getInteger(MediaFormat.KEY_CHANNEL_COUNT);
@@ -314,7 +525,7 @@ public final class Transcoder {
             if (oi < 0) return;
             pendIdx = oi; pendOff = 0;
         }
-        int ii = aEnc.dequeueInputBuffer(0);
+        int ii = aEnc.dequeueInputBuffer(5_000);
         if (ii < 0) return;
         ByteBuffer src = aDec.getOutputBuffer(pendIdx), dst = aEnc.getInputBuffer(ii);
         boolean eos = (pendInfo.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0;
@@ -326,36 +537,13 @@ public final class Transcoder {
             src.position(pendInfo.offset + pendOff); src.limit(pendInfo.offset + pendInfo.size);
             ByteBuffer s = src.slice().order(ByteOrder.nativeOrder()); dst.order(ByteOrder.nativeOrder());
             if (srcChannels == outChannels) { s.limit(frames * inFrame); dst.put(s); }
-            else for (int f = 0; f < frames; f++) { // 简单下混：取前两个声道
+            else for (int f = 0; f < frames; f++)
                 for (int c = 0; c < outChannels; c++) dst.putShort(s.getShort((f * srcChannels + Math.min(c, srcChannels - 1)) * 2));
-            }
             pendOff += frames * inFrame;
         }
         boolean done = pendInfo.size - pendOff < inFrame;
         aEnc.queueInputBuffer(ii, 0, frames * outFrame, pts, done && eos ? MediaCodec.BUFFER_FLAG_END_OF_STREAM : 0);
         if (done) { aDec.releaseOutputBuffer(pendIdx, false); pendIdx = -1; if (eos) aDecEosSent = true; }
-    }
-
-    private void maybeStart() {
-        if (muxStarted || vTrack < 0 || (needAudio && aTrack < 0)) return;
-        muxer.start(); muxStarted = true;
-        for (Object[] o : pending) muxer.writeSampleData((Integer) o[0], (ByteBuffer) o[1], (MediaCodec.BufferInfo) o[2]);
-        pending.clear();
-    }
-
-    private void write(int track, ByteBuffer b, MediaCodec.BufferInfo info) {
-        if (muxStarted) { b.position(info.offset); b.limit(info.offset + info.size); muxer.writeSampleData(track, b, info); return; }
-        ByteBuffer c = ByteBuffer.allocateDirect(info.size);
-        b.position(info.offset); b.limit(info.offset + info.size); c.put(b); c.flip();
-        MediaCodec.BufferInfo i2 = new MediaCodec.BufferInfo(); i2.set(0, info.size, info.presentationTimeUs, info.flags);
-        pending.add(new Object[]{track, c, i2});
-    }
-
-    private static MediaFormat stripProfile(MediaFormat f) {
-        MediaFormat n = MediaFormat.createVideoFormat(f.getString(MediaFormat.KEY_MIME), f.getInteger(MediaFormat.KEY_WIDTH), f.getInteger(MediaFormat.KEY_HEIGHT));
-        for (String k : new String[]{MediaFormat.KEY_COLOR_FORMAT, MediaFormat.KEY_BIT_RATE, MediaFormat.KEY_FRAME_RATE, MediaFormat.KEY_I_FRAME_INTERVAL})
-            n.setInteger(k, f.getInteger(k));
-        return n;
     }
 
     private static int selectTrack(MediaExtractor ex, String prefix) {
@@ -366,11 +554,8 @@ public final class Transcoder {
         return -1;
     }
 
-    private static void rel(MediaCodec c) {
-        if (c == null) return;
-        try { c.stop(); } catch (Exception ignored) {}
-        try { c.release(); } catch (Exception ignored) {}
-    }
+    private static void rel(MediaCodec c) { if (c != null) try { c.release(); } catch (Throwable ignored) {} }
+
 
     // ---------- EGL：编码器输入 Surface ----------
     static final class InputSurface {
@@ -404,8 +589,7 @@ public final class Transcoder {
 
     // ---------- 解码器输出 SurfaceTexture + 绘制（缩放） ----------
     static final class OutputSurface implements SurfaceTexture.OnFrameAvailableListener {
-        final SurfaceTexture st; final Surface surface; final HandlerThread ht;
-        private final Object lock = new Object(); private boolean avail;
+        final SurfaceTexture st; final Surface surface; final Runnable onFrame;
         private final int w, h, prog, tex, aPos, aTex, uMvp, uSt;
         private final float[] stM = new float[16], mvp = new float[16];
         private final FloatBuffer verts;
@@ -414,8 +598,8 @@ public final class Transcoder {
         private static final String FS = "#extension GL_OES_EGL_image_external : require\nprecision mediump float;varying vec2 vTex;" +
                 "uniform samplerExternalOES sTex;void main(){gl_FragColor=texture2D(sTex,vTex);}";
 
-        OutputSurface(int w, int h) {
-            this.w = w; this.h = h;
+        OutputSurface(int w, int h, Handler handler, Runnable onFrame) {
+            this.w = w; this.h = h; this.onFrame = onFrame;
             float[] v = {-1, -1, 0, 0, 0, 1, -1, 0, 1, 0, -1, 1, 0, 0, 1, 1, 1, 0, 1, 1};
             verts = ByteBuffer.allocateDirect(v.length * 4).order(ByteOrder.nativeOrder()).asFloatBuffer(); verts.put(v).position(0);
             prog = program(VS, FS);
@@ -427,21 +611,13 @@ public final class Transcoder {
             GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR);
             GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE);
             GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE);
-            ht = new HandlerThread("frames"); ht.start();
             st = new SurfaceTexture(tex);
-            st.setOnFrameAvailableListener(this, new Handler(ht.getLooper()));
+            st.setOnFrameAvailableListener(this, handler);
             surface = new Surface(st);
             Matrix.setIdentityM(mvp, 0);
         }
-        @Override public void onFrameAvailable(SurfaceTexture s) { synchronized (lock) { avail = true; lock.notifyAll(); } }
-        void awaitNewImage() throws InterruptedException {
-            synchronized (lock) {
-                long end = System.currentTimeMillis() + 5000;
-                while (!avail) { long r = end - System.currentTimeMillis(); if (r <= 0) throw new RuntimeException("解码帧等待超时"); lock.wait(r); }
-                avail = false;
-            }
-            st.updateTexImage();
-        }
+        @Override public void onFrameAvailable(SurfaceTexture s) { onFrame.run(); }
+        void latch() { st.updateTexImage(); }
         void drawImage() {
             st.getTransformMatrix(stM);
             GLES20.glViewport(0, 0, w, h);
@@ -453,7 +629,7 @@ public final class Transcoder {
             GLES20.glUniformMatrix4fv(uMvp, 1, false, mvp, 0); GLES20.glUniformMatrix4fv(uSt, 1, false, stM, 0);
             GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
         }
-        void release() { surface.release(); st.release(); ht.quitSafely(); GLES20.glDeleteProgram(prog); }
+        void release() { surface.release(); st.release(); GLES20.glDeleteProgram(prog); }
 
         static int shader(int type, String src) {
             int s = GLES20.glCreateShader(type); GLES20.glShaderSource(s, src); GLES20.glCompileShader(s);
