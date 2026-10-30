@@ -36,7 +36,7 @@ public class MainActivity extends Activity {
     private RadioGroup presetGroup;
     private Spinner spCodec, spRes, spAudio;
     private SeekBar sbQuality; private TextView tvQuality, tvSummary;
-    private EditText etBitrate;
+    private EditText etBitrate; private CheckBox cbCompat;
     private Button btnStart, btnCancel, btnPick, btnClear;
 
     @Override protected void onCreate(Bundle b) {
@@ -142,6 +142,9 @@ public class MainActivity extends Activity {
         customPanel.addView(etBitrate);
         customPanel.addView(label("音频", 14, false));
         spAudio = spinner(new String[]{"直接复制（AAC 源）", "AAC 192 kbps", "AAC 128 kbps", "AAC 96 kbps", "AAC 64 kbps"}, 0); customPanel.addView(spAudio);
+        cbCompat = new CheckBox(this); cbCompat.setText("兼容模式：使用系统 MediaMuxer（单文件 ≤4GB，仅在默认写入器出错时使用）");
+        cbCompat.setOnCheckedChangeListener((b2, c) -> refreshEstimates());
+        customPanel.addView(cbCompat);
         root.addView(customPanel);
 
         LinearLayout row = new LinearLayout(this); row.setOrientation(LinearLayout.HORIZONTAL); row.setPadding(0, dp(12), 0, dp(4));
@@ -173,7 +176,7 @@ public class MainActivity extends Activity {
             toast("日志已复制，可粘贴发送");
         });
         bMore.setOnClickListener(v -> { logExpanded = !logExpanded; renderLog(); });
-        root.addView(label("说明：若预计输出不小于原文件，将自动跳过并提示；压缩后若实际体积反而更大，也不会保存。AVI 等系统不支持的格式会提示错误。处理在前台服务中进行，熄屏或切换应用也会继续，通知栏可查看进度和取消。单个 MP4 超过约 3.5 GB 会自动分段保存。", 12, false));
+        root.addView(label("说明：若预计输出不小于原文件，将自动跳过并提示；压缩后若实际体积反而更大，也不会保存。AVI 等系统不支持的格式会提示错误。处理在前台服务中进行，熄屏或切换应用也会继续，通知栏可查看进度和取消。输出使用自研 64 位 MP4 写入器，超过 4 GB 也保存为单个文件。", 12, false));
         setContentView(sv);
     }
 
@@ -235,6 +238,7 @@ public class MainActivity extends Activity {
             int r = spRes.getSelectedItemPosition(); s.maxShort = r == 1 ? 1080 : r == 2 ? 720 : 0;
             s.quality = sbQuality.getProgress() + 1;
             try { String t = etBitrate.getText().toString().trim(); if (!t.isEmpty()) s.customBps = (long) (Double.parseDouble(t) * 1_000_000); } catch (Exception ignored) {}
+            s.compat = cbCompat.isChecked();
             int a = spAudio.getSelectedItemPosition(); s.audioBps = new int[]{-1, 192_000, 128_000, 96_000, 64_000}[a];
         } else if (s.preset == BitrateCalc.SMALL) { s.maxShort = 1080; s.audioBps = 96_000; }
         return s;

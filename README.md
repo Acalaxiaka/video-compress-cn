@@ -1,9 +1,9 @@
 # 视频压缩（video-compress-cn）
 
-安卓端**硬件加速**视频格式转换与压缩工具：在尽量保留画质的前提下压缩体积。界面全中文，安装包约 95 KB，无第三方依赖。
+安卓端**硬件加速**视频格式转换与压缩工具：在尽量保留画质的前提下压缩体积。界面全中文，安装包约 100 KB，无第三方依赖。
 
 ## 下载
-到 [Releases](https://github.com/Acalaxiaka/video-compress-cn/releases) 下载 `VideoCompress-v1.0.1.apk`（Android 8.0+）。
+到 [Releases](https://github.com/Acalaxiaka/video-compress-cn/releases) 下载 `VideoCompress-v1.0.2.apk`（Android 8.0+）。
 
 ## 功能
 - **硬件编码**：MediaCodec + MediaMuxer 直接调用手机硬件编码器；优先 **HEVC/H.265**，不支持时回退 **H.264**；Android 14+ 且有**硬件 AV1 编码器**时自动使用 AV1。
@@ -23,8 +23,15 @@
 - 显示进度、剩余时间、预计体积、压缩前后大小与压缩比。
 - 输入：MP4、MOV、3GP、MKV、WebM（取决于系统解析器）；AVI 等不支持时给出中文错误提示。输出统一为 MP4。
 
+## v1.0.2 更新
+- **不再分段**：内置自研纯 Java MP4 写入器（Mp4Writer），超过 4 GB 也输出为**单个文件**：mdat 64 位 largesize、co64 64 位块偏移、超长时长自动使用 version 1 的 mvhd/tkhd/mdhd/elst。
+- 支持 HEVC（hvc1/hvcC）、H.264（avc1/avcC）、AAC（esds）；B 帧使用 ctts + 编辑列表；旋转写入 tkhd 矩阵；moov 位于文件末尾。
+- 样本直接流式写入相册文件（rw 可 seek），样本表使用紧凑数组，多小时视频内存占用约数 MB。
+- “自定义”中新增**兼容模式**（系统 MediaMuxer，单文件 ≤4GB），仅在默认写入器出错时使用；AV1 输出自动使用系统复用器。
+- 测试：`android/test/mux/run_mux_tests.sh [big]` 用 ffmpeg 生成真实码流，复用后用 ffprobe/ffmpeg 校验（逐帧一致、无解码错误、>4GB 文件）。
+
 ## v1.0.1 更新
-- 修复长视频在约 74% 处卡死且无法取消的问题：MP4 单文件超过约 3.5 GB 自动分段（MediaMuxer 32 位偏移上限 4 GB）。
+- 修复长视频在约 74% 处卡死且无法取消的问题（系统 MediaMuxer 4 GB 上限）。
 - 异步 MediaCodec 流水线，所有等待均带超时；看门狗 20 秒无进展即保存已完成部分并给出错误码（E-STALL / E-MUX / E-CODEC / E-INIT / E-IO）。
 - 取消在 5 秒内必定生效并复位界面。
 - 前台服务 + 通知栏进度，熄屏/切后台继续处理。

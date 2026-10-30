@@ -83,6 +83,9 @@ public final class Engine {
         if (BitrateCalc.shouldSkip(pl.estBytes, p.size)) {
             j.state = SKIPPED; set(j, gen, j.name + "\n⏭ 已跳过：预计输出 " + BitrateCalc.human(pl.estBytes) + " 不小于原文件 " + BitrateCalc.human(p.size) + "，无需重新编码。", 0xFFEF6C00); return;
         }
+        if (pl.compat && pl.estBytes > 3_900_000_000L) {
+            j.state = FAILED; set(j, gen, j.name + "\n❌ 兼容模式（系统 MediaMuxer）单文件上限约 4 GB，预计输出 " + BitrateCalc.human(pl.estBytes) + "。请关闭兼容模式或选择更小体积。", 0xFFC62828); return;
+        }
         j.state = RUNNING; currentJob = j;
         final String head = j.name + "\n" + CodecSupport.label(pl.mime) + " · " + pl.encName + " · " + pl.w + "×" + pl.h + " · "
                 + String.format(Locale.CHINA, "%.2f Mbps", pl.vBps / 1e6) + " · 预计 " + BitrateCalc.human(pl.estBytes);
@@ -94,7 +97,7 @@ public final class Engine {
         Transcoder t = new Transcoder(); current = t;
         final long t0 = System.currentTimeMillis(); final Eta eta = new Eta(60_000);
         try {
-            Transcoder.Result r = t.run(ctx, j.uri, p, pl, idx -> { Transcoder.Seg sg = newSeg(ctx, base + (idx == 0 ? "" : "_part" + (idx + 1)) + ".mp4"); created.add(sg); return sg; },
+            Transcoder.Result r = t.run(ctx, j.uri, p, pl, idx -> { Transcoder.Seg sg = newSeg(ctx, base + ".mp4"); created.add(sg); return sg; },
                     prog -> {
                         double e = eta.update(System.currentTimeMillis(), prog);
                         j.progress = prog; notifProgress = prog;
@@ -110,7 +113,7 @@ public final class Engine {
             }
             StringBuilder where = new StringBuilder();
             for (int i = 0; i < created.size(); i++) {
-                String suf = r.partial ? "_partial" : (created.size() > 1 && i == 0 ? "_part1" : "");
+                String suf = r.partial ? "_partial" : "";
                 created.get(i).commit(suf); where.append("\n").append(created.get(i).where());
             }
             j.outSize = out; j.progress = 1;
@@ -121,7 +124,7 @@ public final class Engine {
             } else {
                 j.state = DONE;
                 set(j, gen, String.format(Locale.CHINA, "%s\n✅ 完成：%s → %s（%s）\n%s %d×%d · 用时 %s%s\n已保存：%s", j.name, BitrateCalc.human(p.size), BitrateCalc.human(out),
-                        MainActivity.pct(out, p.size), CodecSupport.label(pl.mime), pl.w, pl.h, Eta.fmt(secs), created.size() > 1 ? " · 已分为 " + created.size() + " 段（单个 MP4 限 4GB）" : "", where), 0xFF2E7D32);
+                        MainActivity.pct(out, p.size), CodecSupport.label(pl.mime), pl.w, pl.h, Eta.fmt(secs), " · " + (pl.compat ? "系统复用器" : "64 位 MP4 写入器"), where), 0xFF2E7D32);
             }
             AppLog.i("完成：" + out + "B 用时 " + Math.round(secs) + "s 分段 " + created.size() + (r.partial ? " (partial)" : ""));
         } catch (InterruptedException e) {
@@ -130,7 +133,7 @@ public final class Engine {
         } catch (Throwable e) {
             for (Transcoder.Seg sg : created) sg.discard();
             AppLog.w("失败：" + e + " | " + t.diag());
-            j.state = FAILED; set(j, gen, j.name + "\n❌ 转换失败：" + MainActivity.friendly(e) + "\n请点击“复制日志”反馈。", 0xFFC62828);
+            j.state = FAILED; set(j, gen, j.name + "\n❌ 转换失败：" + MainActivity.friendly(e) + (pl.compat ? "" : "\n可在“自定义”中勾选“兼容模式”后重试。") + "\n请点击“复制日志”反馈。", 0xFFC62828);
         } finally {
             if (gen == generation) { current = null; currentJob = null; }
             changed();
@@ -151,6 +154,7 @@ public final class Engine {
             return new Transcoder.Seg() {
                 String finalName = name;
                 public MediaMuxer createMuxer() throws IOException { return new MediaMuxer(pfd.getFileDescriptor(), MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4); }
+                public java.nio.channels.FileChannel channel() { return new ParcelFileDescriptor.AutoCloseOutputStream(pfd).getChannel(); } // rw 可 seek，用于回填 mdat 大小
                 public void commit(String suffix) throws IOException {
                     try { pfd.close(); } catch (IOException ignored) {}
                     ContentValues c = new ContentValues(); c.put(MediaStore.Video.Media.IS_PENDING, 0);
@@ -168,6 +172,7 @@ public final class Engine {
         return new Transcoder.Seg() {
             File cur = f;
             public MediaMuxer createMuxer() throws IOException { return new MediaMuxer(f.getAbsolutePath(), MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4); }
+            public java.nio.channels.FileChannel channel() throws IOException { return new java.io.RandomAccessFile(f, "rw").getChannel(); }
             public void commit(String suffix) {
                 if (!suffix.isEmpty()) { File n = new File(dir, f.getName().replace(".mp4", suffix + ".mp4")); if (f.renameTo(n)) cur = n; }
                 android.media.MediaScannerConnection.scanFile(ctx, new String[]{cur.getAbsolutePath()}, null, null);

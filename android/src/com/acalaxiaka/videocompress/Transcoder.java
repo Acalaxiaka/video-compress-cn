@@ -26,6 +26,7 @@ public final class Transcoder {
         public int quality = 50;           // 自定义画质 1..100
         public long customBps = 0;         // 自定义码率，0=按画质
         public int audioBps = -1;          // -1=尽量直接复制, >0=AAC 重编码码率
+        public boolean compat = false;     // 兼容模式：系统 MediaMuxer（单文件 4GB 上限）
     }
 
     public static final class Probe {
@@ -34,7 +35,7 @@ public final class Transcoder {
     }
 
     public static final class Plan {
-        public String mime, encName; public int w, h; public long vBps, aBps, estBytes; public boolean audioCopy;
+        public String mime, encName; public int w, h; public long vBps, aBps, estBytes; public boolean audioCopy, compat;
     }
 
     public static class TranscodeException extends Exception { public TranscodeException(String m) { super(m); } }
@@ -136,13 +137,16 @@ public final class Transcoder {
             pl.aBps = pl.audioCopy ? (p.aBps > 0 ? p.aBps : 128_000) : (s.audioBps > 0 ? s.audioBps : 128_000);
         }
         pl.estBytes = BitrateCalc.estimateBytes(pl.vBps, pl.aBps, p.durUs);
+        pl.compat = s.compat || BitrateCalc.AV1.equals(pl.mime); // AV1 由系统复用器处理
         return pl;
     }
 
     // ---------- 转码（异步 MediaCodec + 看门狗） ----------
-    /** 单个输出分段（MP4 32 位偏移上限约 4 GB，超过 SEG_LIMIT 自动切分为多个文件）。 */
+    /** 输出文件（单文件；自研 Mp4Writer 支持 >4GB）。 */
     public static abstract class Seg {
         public abstract MediaMuxer createMuxer() throws java.io.IOException;
+        public abstract java.nio.channels.FileChannel channel() throws java.io.IOException;
+        public Mux createMux(boolean compat) throws java.io.IOException { return compat ? new Mux.System(createMuxer()) : new Mux.Mp4(channel()); }
         public abstract void commit(String suffix) throws java.io.IOException;
         public abstract void discard();
         public abstract String where();
@@ -152,15 +156,14 @@ public final class Transcoder {
     public interface Listener { void onProgress(float p); }
     public static final class Result { public final List<Seg> segs = new ArrayList<>(); public long bytes; public boolean partial; public String partialReason; }
 
-    public static long SEG_LIMIT = 3_500_000_000L;   // 留足 moov 空间，低于 4 GiB
     public static long STALL_MS = 20_000;
 
     private final Object mx = new Object(), gate = new Object();
-    private MediaMuxer muxer; private boolean muxStarted; private int vTrack = -1, aTrack = -1;
+    private Mux muxer; private boolean muxStarted; private int vTrack = -1, aTrack = -1;
     private MediaFormat vOutFmt, aOutFmt; private boolean needAudio;
     private final List<Object[]> pending = new ArrayList<>();
     private final Result result = new Result(); private Seg seg; private Sink sink; private int rotation;
-    private volatile boolean rollRequested, videoDone, audioDone, decEos, rendering, failedFlag;
+    private volatile boolean videoDone, audioDone, decEos, rendering, failedFlag;
     private volatile Throwable error; private volatile long lastProgressMs, lastVideoPts = -1, lastRenderPts = -1, framesIn, framesOut, framesEnc;
     private volatile String stage = "init";
     private final java.util.ArrayDeque<long[]> decQ = new java.util.ArrayDeque<>();
@@ -192,7 +195,8 @@ public final class Transcoder {
                 else if (findDecoder(af) == null) { needAudio = false; AppLog.w("音频无法解码，输出无声视频"); }
             }
             seg = sink.open(0); result.segs.add(seg);
-            muxer = seg.createMuxer(); muxer.setOrientationHint(rotation);
+            muxer = seg.createMux(pl.compat); muxer.setOrientationHint(rotation);
+            AppLog.i("复用器：" + muxer.name());
             if (needAudio && pl.audioCopy) aTrack = muxer.addTrack(aOutFmt);
 
             glT = new HandlerThread("vc-gl"); glT.start(); glH = new Handler(glT.getLooper());
@@ -251,7 +255,12 @@ public final class Transcoder {
                 try {
                     ByteBuffer b = c.getOutputBuffer(i);
                     boolean eos = (info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0;
+                    if ((info.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0 && info.size > 0 && b != null) {
+                        ByteBuffer d = b.duplicate(); d.position(info.offset); d.limit(info.offset + info.size);
+                        configBytes = new byte[info.size]; d.get(configBytes);
+                    }
                     if ((info.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0 && info.size > 0 && b != null) {
+                        ensureVideoTrack();
                         writeSample(true, b, info); framesEnc++; lastVideoPts = info.presentationTimeUs;
                     }
                     c.releaseOutputBuffer(i, false);
@@ -259,7 +268,7 @@ public final class Transcoder {
                 } catch (Throwable t) { if (!canceled) fail(t); }
             }
             public void onError(MediaCodec c, MediaCodec.CodecException e) { if (!canceled) fail(e); }
-            public void onOutputFormatChanged(MediaCodec c, MediaFormat f) { synchronized (mx) { vOutFmt = f; vTrack = muxer.addTrack(f); maybeStart(); } }
+            public void onOutputFormatChanged(MediaCodec c, MediaFormat f) { synchronized (mx) { vOutFmt = f; } }
         };
         enc.setCallback(encCb, encH);
         try { enc.configure(ef, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE); }
@@ -356,7 +365,21 @@ public final class Transcoder {
         return ef;
     }
 
-    // ---- 复用器（线程安全；分段；记录进度） ----
+    private volatile byte[] configBytes;
+    /** 首个视频样本到来时再添加视频轨：若输出格式缺少 csd-0，则用 CODEC_CONFIG 缓冲补齐。 */
+    private void ensureVideoTrack() {
+        synchronized (mx) {
+            if (vTrack >= 0 || muxer == null) return;
+            if (vOutFmt == null) throw new IllegalStateException("编码器未给出输出格式");
+            if (!vOutFmt.containsKey("csd-0") && configBytes != null) {
+                if (BitrateCalc.AVC.equals(vOutFmt.getString(MediaFormat.KEY_MIME))) vOutFmt.setByteBuffer("csd-0", ByteBuffer.wrap(configBytes)); // SPS+PPS 均在其中，写入器按类型拆分
+                else vOutFmt.setByteBuffer("csd-0", ByteBuffer.wrap(configBytes));
+            }
+            vTrack = muxer.addTrack(vOutFmt); maybeStart();
+        }
+    }
+
+    // ---- 复用器（线程安全；记录进度） ----
     private void maybeStart() {
         if (muxStarted || vTrack < 0 || (needAudio && aTrack < 0)) return;
         muxer.start(); muxStarted = true; AppLog.i("复用器启动");
@@ -374,26 +397,10 @@ public final class Transcoder {
                 MediaCodec.BufferInfo i2 = new MediaCodec.BufferInfo(); i2.set(0, info.size, info.presentationTimeUs, info.flags);
                 pending.add(new Object[]{video, c, i2}); touch(); return;
             }
-            if (video && rollRequested && (info.flags & MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0) roll();
             muxer.writeSampleData(video ? vTrack : aTrack, b, info);
             seg.bytes += info.size; touch();
-            if (video && !rollRequested && seg.bytes > SEG_LIMIT) {
-                rollRequested = true; AppLog.i("分段达到 " + BitrateCalc.human(seg.bytes) + "，请求关键帧以切分（MP4 4GB 限制）");
-                android.os.Bundle bd = new android.os.Bundle(); bd.putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0);
-                try { enc.setParameters(bd); } catch (Exception ignored) {}
-            }
         }
         synchronized (gate) { gate.notifyAll(); }
-    }
-
-    private void roll() throws Exception {
-        muxer.stop(); muxer.release();
-        AppLog.i("分段 " + result.segs.size() + " 完成：" + BitrateCalc.human(seg.bytes));
-        seg = sink.open(result.segs.size()); result.segs.add(seg);
-        muxer = seg.createMuxer(); muxer.setOrientationHint(rotation);
-        vTrack = muxer.addTrack(vOutFmt);
-        if (needAudio) aTrack = muxer.addTrack(aOutFmt);
-        muxer.start(); rollRequested = false;
     }
 
     /** 在独立线程中结束复用器，超时则放弃（避免卡死）。 */
@@ -439,7 +446,7 @@ public final class Transcoder {
         if (t.isAlive()) AppLog.w("资源释放超时，已放弃等待（后台线程将自行结束）");
         if (audioThread != null) audioThread.interrupt();
         // 若复用器仍未释放（异常路径），尝试在后台释放
-        final MediaMuxer m = muxer; muxer = null;
+        final Mux m = muxer; muxer = null;
         if (m != null) { Thread r = new Thread(() -> { try { m.release(); } catch (Throwable ignored) {} }); r.setDaemon(true); r.start(); }
     }
 
