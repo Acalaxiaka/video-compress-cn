@@ -3,7 +3,7 @@
 安卓端**硬件加速**视频格式转换与压缩工具：在尽量保留画质的前提下压缩体积。界面全中文，安装包约 100 KB，无第三方依赖。
 
 ## 下载
-到 [Releases](https://github.com/Acalaxiaka/video-compress-cn/releases) 下载 `VideoCompress-v1.0.2.apk`（Android 8.0+）。
+到 [Releases](https://github.com/Acalaxiaka/video-compress-cn/releases) 下载 `VideoCompress-v1.0.3.apk`（Android 8.0+）。
 
 ## 功能
 - **硬件编码**：MediaCodec + MediaMuxer 直接调用手机硬件编码器；优先 **HEVC/H.265**，不支持时回退 **H.264**；Android 14+ 且有**硬件 AV1 编码器**时自动使用 AV1。
@@ -22,6 +22,10 @@
 - **防止越压越大**：预计体积 ≥ 原文件 95% 时跳过；压缩后实际更大也不保存，并提示。
 - 显示进度、剩余时间、预计体积、压缩前后大小与压缩比。
 - 输入：MP4、MOV、3GP、MKV、WebM（取决于系统解析器）；AVI 等不支持时给出中文错误提示。输出统一为 MP4。
+
+## v1.0.3 更新
+- 修复 v1.0.1/v1.0.2 在约 2% 处停滞：视频处理回退为 v1.0.0 已在真机验证的**同步流水线**（解码→GL→编码同一线程，所有 dequeue/等待带超时并检查取消），音频按视频时间轴交错写入；去掉编码器 priority/operating-rate 参数。
+- 保留：自研 64 位 Mp4Writer（>4GB 单文件）、看门狗（20 秒无进展）、5 秒内取消、前台服务、剩余时间估算、诊断日志、兼容模式。
 
 ## v1.0.2 更新
 - **不再分段**：内置自研纯 Java MP4 写入器（Mp4Writer），超过 4 GB 也输出为**单个文件**：mdat 64 位 largesize、co64 64 位块偏移、超长时长自动使用 version 1 的 mvhd/tkhd/mdhd/elst。
