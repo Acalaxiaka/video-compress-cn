@@ -20,6 +20,7 @@ public class BitrateCalcTest {
         long hi = BitrateCalc.videoBitrate(BitrateCalc.HEVC, BitrateCalc.baseBpp(0), 1920, 1080, 30, 1920, 1080, 0, true);
         long sm = BitrateCalc.videoBitrate(BitrateCalc.HEVC, BitrateCalc.baseBpp(2), 1920, 1080, 30, 1920, 1080, 0, false);
         check(hi > b && b > sm, "高画质 > 均衡 > 小体积");
+        check(Math.abs(sm / (double) b - 0.7) < 0.01, "小体积 ≈ 均衡 70%: " + sm);
         long f60 = BitrateCalc.videoBitrate(BitrateCalc.HEVC, 0.065, 1920, 1080, 60, 1920, 1080, 0, false);
         check(f60 > b && f60 < 2 * b, "60fps 码率增加但小于2倍");
         // 源码率上限

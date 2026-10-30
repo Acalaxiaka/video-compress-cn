@@ -12,7 +12,7 @@ public final class BitrateCalc {
     public static double baseBpp(int preset) {
         switch (preset) {
             case HIGH: return 0.10;     // 近视觉无损
-            case SMALL: return 0.035;   // 小体积
+            case SMALL: return 0.065 * 0.7; // 小体积：均衡的 70%（≈0.0455，v1.0.3 为 0.035）
             default: return 0.065;      // 均衡（0.05–0.08 区间中位）
         }
     }

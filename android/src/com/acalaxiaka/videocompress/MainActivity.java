@@ -116,7 +116,7 @@ public class MainActivity extends Activity {
 
         root.addView(label("压缩预设", 16, true));
         presetGroup = new RadioGroup(this);
-        String[] presets = {"高画质（接近视觉无损）", "均衡（推荐）", "小体积", "自定义"};
+        String[] presets = {"高画质（接近视觉无损）", "均衡（推荐）", "小体积（约均衡 70% 码率）", "自定义"};
         for (int i = 0; i < presets.length; i++) { RadioButton rb = new RadioButton(this); rb.setText(presets[i]); rb.setId(100 + i); presetGroup.addView(rb); }
         presetGroup.check(101);
         presetGroup.setOnCheckedChangeListener((g, id) -> { customPanel.setVisibility(id == 103 ? View.VISIBLE : View.GONE); refreshEstimates(); });
@@ -240,7 +240,7 @@ public class MainActivity extends Activity {
             try { String t = etBitrate.getText().toString().trim(); if (!t.isEmpty()) s.customBps = (long) (Double.parseDouble(t) * 1_000_000); } catch (Exception ignored) {}
             s.compat = cbCompat.isChecked();
             int a = spAudio.getSelectedItemPosition(); s.audioBps = new int[]{-1, 192_000, 128_000, 96_000, 64_000}[a];
-        } else if (s.preset == BitrateCalc.SMALL) { s.maxShort = 1080; s.audioBps = 96_000; }
+        } else if (s.preset == BitrateCalc.SMALL) { s.audioBps = 96_000; } // 分辨率/帧率与均衡一致，仅码率为均衡的 70%
         return s;
     }
 
